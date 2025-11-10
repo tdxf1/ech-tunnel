@@ -350,6 +350,8 @@ func runWebSocketServer(addr string) {
 			}
 			return []string{token}
 		}(),
+		ReadBufferSize:  65536, // 增加读缓冲区到64KB
+		WriteBufferSize: 65536, // 增加写缓冲区到64KB
 	}
 
 	http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
@@ -888,7 +890,7 @@ func dialWebSocketWithECH(wsServerAddr string, maxRetries int) (*websocket.Conn,
 			return nil, fmt.Errorf("构建 TLS(ECH) 配置失败: %v", tlsErr)
 		}
 
-		// 配置WebSocket Dialer
+		// 配置WebSocket Dialer（增加缓冲区大小）
 		dialer := websocket.Dialer{
 			TLSClientConfig: tlsCfg,
 			Subprotocols: func() []string {
@@ -898,6 +900,8 @@ func dialWebSocketWithECH(wsServerAddr string, maxRetries int) (*websocket.Conn,
 				return []string{token}
 			}(),
 			HandshakeTimeout: 10 * time.Second,
+			ReadBufferSize:   65536, // 增加读缓冲区到64KB
+			WriteBufferSize:  65536, // 增加写缓冲区到64KB
 		}
 
 		// 如果指定了IP地址，配置自定义拨号器（SNI 仍为 serverName）
@@ -987,6 +991,7 @@ type UDPAssociation struct {
 	mu            sync.Mutex
 	closed        bool
 	done          chan bool
+	receiving     bool // 是否已启动接收goroutine
 }
 
 func parseSOCKS5Addr(addr string) (*SOCKS5Config, error) {
@@ -1600,32 +1605,14 @@ func (assoc *UDPAssociation) handleUDPPacket(packet []byte) {
 	}
 
 	// 启动接收goroutine（只启动一次）
-	if !assoc.isReceiving() {
+	assoc.mu.Lock()
+	if !assoc.receiving {
+		assoc.receiving = true
+		assoc.mu.Unlock()
 		go assoc.receiveUDPData()
+	} else {
+		assoc.mu.Unlock()
 	}
-}
-
-var (
-	receivingMu sync.Mutex
-	receiving   = make(map[*UDPAssociation]bool)
-)
-
-func (assoc *UDPAssociation) isReceiving() bool {
-	receivingMu.Lock()
-	defer receivingMu.Unlock()
-	return receiving[assoc]
-}
-
-func (assoc *UDPAssociation) setReceiving() {
-	receivingMu.Lock()
-	defer receivingMu.Unlock()
-	receiving[assoc] = true
-}
-
-func (assoc *UDPAssociation) clearReceiving() {
-	receivingMu.Lock()
-	defer receivingMu.Unlock()
-	delete(receiving, assoc)
 }
 
 // sendUDPData 通过WebSocket发送UDP数据
@@ -1654,8 +1641,11 @@ func (assoc *UDPAssociation) sendUDPData(target string, data []byte) error {
 
 // receiveUDPData 接收WebSocket返回的UDP数据
 func (assoc *UDPAssociation) receiveUDPData() {
-	assoc.setReceiving()
-	defer assoc.clearReceiving()
+	defer func() {
+		assoc.mu.Lock()
+		assoc.receiving = false
+		assoc.mu.Unlock()
+	}()
 
 	for {
 		if assoc.IsClosed() {
