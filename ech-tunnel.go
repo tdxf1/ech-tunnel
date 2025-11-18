@@ -436,6 +436,7 @@ func runWebSocketServer(addr string) {
 
 func handleWebSocket(wsConn *websocket.Conn) {
 	var mu sync.Mutex
+	var connMu sync.RWMutex
 	conns := make(map[string]net.Conn)
 
 	// UDP 连接管理
@@ -443,12 +444,16 @@ func handleWebSocket(wsConn *websocket.Conn) {
 	udpTargets := make(map[string]*net.UDPAddr)
 
 	defer func() {
+		connMu.RLock()
 		for _, c := range conns {
 			_ = c.Close()
 		}
+		connMu.RUnlock()
+		connMu.RLock()
 		for _, uc := range udpConns {
 			_ = uc.Close()
 		}
+		connMu.RUnlock()
 		_ = wsConn.Close()
 		log.Printf("WebSocket 连接 %s 已关闭", wsConn.RemoteAddr())
 	}()
@@ -478,8 +483,12 @@ func handleWebSocket(wsConn *websocket.Conn) {
 					connID := parts[0]
 					data := []byte(parts[1])
 
-					if udpConn, ok := udpConns[connID]; ok {
-						if targetAddr, ok := udpTargets[connID]; ok {
+					connMu.RLock()
+					udpConn, ok1 := udpConns[connID]
+					targetAddr, ok2 := udpTargets[connID]
+					connMu.RUnlock()
+					if ok1 {
+						if ok2 {
 							if _, err := udpConn.WriteToUDP(data, targetAddr); err != nil {
 								log.Printf("[服务端UDP:%s] 发送到目标失败: %v", connID, err)
 							} else {
@@ -498,7 +507,10 @@ func handleWebSocket(wsConn *websocket.Conn) {
 				if len(parts) == 2 {
 					connID := parts[0]
 					payload := parts[1]
-					if c, ok := conns[connID]; ok {
+					connMu.RLock()
+					c, ok := conns[connID]
+					connMu.RUnlock()
+					if ok {
 						if _, err := c.Write([]byte(payload)); err != nil && !isNormalCloseError(err) {
 							log.Printf("[服务端] 写入目标失败: %v", err)
 							return
@@ -539,8 +551,10 @@ func handleWebSocket(wsConn *websocket.Conn) {
 					continue
 				}
 
+				connMu.Lock()
 				udpConns[connID] = udpConn
 				udpTargets[connID] = udpAddr
+				connMu.Unlock()
 
 				// 启动 UDP 接收 goroutine
 				go func(cID string, uc *net.UDPConn) {
@@ -626,14 +640,18 @@ func handleWebSocket(wsConn *websocket.Conn) {
 					}
 
 					// 保存连接
+					connMu.Lock()
 					conns[id] = tcpConn
+					connMu.Unlock()
 
 					// 发送第一帧
 					if firstFrame != "" {
 						if _, err := tcpConn.Write([]byte(firstFrame)); err != nil {
 							log.Printf("[服务端] 发送第一帧失败: %v", err)
 							_ = tcpConn.Close()
+							connMu.Lock()
 							delete(conns, id)
+							connMu.Unlock()
 							return
 						}
 					}
@@ -656,7 +674,9 @@ func handleWebSocket(wsConn *websocket.Conn) {
 								_ = wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE:"+id))
 								mu.Unlock()
 								_ = tcpConn.Close()
+								connMu.Lock()
 								delete(conns, id)
+								connMu.Unlock()
 								return
 							}
 							mu.Lock()
@@ -672,7 +692,10 @@ func handleWebSocket(wsConn *websocket.Conn) {
 			if len(parts) == 2 {
 				id := parts[0]
 				payload := parts[1]
-				if c, ok := conns[id]; ok {
+				connMu.RLock()
+				c, ok := conns[id]
+				connMu.RUnlock()
+				if ok {
 					if _, err := c.Write([]byte(payload)); err != nil && !isNormalCloseError(err) {
 						log.Printf("[服务端] 写入目标失败: %v", err)
 						return
@@ -682,9 +705,14 @@ func handleWebSocket(wsConn *websocket.Conn) {
 			continue
 		} else if strings.HasPrefix(data, "CLOSE:") {
 			id := strings.TrimPrefix(data, "CLOSE:")
-			if c, ok := conns[id]; ok {
+			connMu.RLock()
+			c, ok := conns[id]
+			connMu.RUnlock()
+			if ok {
 				_ = c.Close()
+				connMu.Lock()
 				delete(conns, id)
+				connMu.Unlock()
 				log.Printf("[服务端] 客户端请求关闭连接: %s", id)
 			}
 			continue
@@ -1163,13 +1191,13 @@ func (p *ECHPool) handleChannel(channelID int, wsConn *websocket.Conn) {
 		if mt == websocket.BinaryMessage {
 			// 处理 UDP 数据响应: UDP_DATA:<connID>|<host>:<port>|<data>
 			if len(msg) > 9 && string(msg[:9]) == "UDP_DATA:" {
-                parts := bytes.SplitN(msg[9:], []byte("|"), 3)
-                if len(parts) == 3 {
-                    addrData := string(parts[1])
-                    data := parts[2]
+				parts := bytes.SplitN(msg[9:], []byte("|"), 3)
+				if len(parts) == 3 {
+					addrData := string(parts[1])
+					data := parts[2]
 
 					p.mu.RLock()
-                    assoc := p.udpMap[string(parts[0])]
+					assoc := p.udpMap[string(parts[0])]
 					p.mu.RUnlock()
 
 					if assoc != nil {
@@ -1699,7 +1727,7 @@ func handleSOCKS5Connect(conn net.Conn, target, clientAddr, wsServerAddr string)
 
 // handleSOCKS5UDPAssociate 处理UDP ASSOCIATE请求（使用ECH连接池）
 func handleSOCKS5UDPAssociate(tcpConn net.Conn, clientAddr, wsServerAddr string, config *SOCKS5Config) error {
-    _ = wsServerAddr
+	_ = wsServerAddr
 	log.Printf("[SOCKS5:%s] 处理UDP ASSOCIATE请求（使用连接池）", clientAddr)
 
 	// 获取SOCKS5服务器的监听IP（根据配置）
