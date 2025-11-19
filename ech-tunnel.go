@@ -291,7 +291,7 @@ func parseHTTPSRecord(data []byte) string {
 	return ""
 }
 
-// ======================== WebSocket 服务端（修复版） ========================
+// ======================== WebSocket 服务端 ========================
 
 func generateSelfSignedCert() (tls.Certificate, error) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -435,7 +435,6 @@ func runWebSocketServer(addr string) {
 	}
 }
 
-// ======================== 修复后的 handleWebSocket ========================
 func handleWebSocket(wsConn *websocket.Conn) {
 	// 创建一个 context 用于通知所有 goroutine 退出
 	ctx, cancel := context.WithCancel(context.Background())
@@ -900,15 +899,22 @@ func startMultiChannelTCPForwarder(listenAddress, targetAddress string, pool *EC
 		}
 
 		go func(cID string, c net.Conn) {
+			// ==== 修复：确保退出时通知服务端关闭连接 ====
+			defer func() {
+				_ = pool.SendClose(cID)
+				_ = c.Close()
+			}()
+
 			buf := make([]byte, 32768)
 			for {
 				n, err := c.Read(buf)
 				if err != nil {
-					_ = pool.SendClose(cID)
-					_ = c.Close()
-					return
+					return // 触发 defer 发送 CLOSE
 				}
-				_ = pool.SendData(cID, buf[:n])
+				if err := pool.SendData(cID, buf[:n]); err != nil {
+					log.Printf("[客户端] 发送数据到通道失败: %v", err)
+					return // 通道错误，也触发 defer
+				}
 			}
 		}(connID, tcpConn)
 	}
@@ -1297,7 +1303,19 @@ func (p *ECHPool) handleChannel(channelID int, wsConn *websocket.Conn) {
 					c := p.tcpMap[id]
 					p.mu.RUnlock()
 					if c != nil {
-						_, _ = c.Write([]byte(payload))
+						// ==== 修复：如果写入本地失败，通知服务端关闭 ====
+						if _, err := c.Write([]byte(payload)); err != nil {
+							log.Printf("[客户端] 写入本地TCP连接失败: %v，发送CLOSE", err)
+							go p.SendClose(id)
+							c.Close()
+							// 清理本地映射
+							p.mu.Lock()
+							delete(p.tcpMap, id)
+							p.mu.Unlock()
+						}
+					} else {
+						// 连接不存在，发送关闭以防万一
+						go p.SendClose(id)
 					}
 					continue
 				}
@@ -1307,7 +1325,15 @@ func (p *ECHPool) handleChannel(channelID int, wsConn *websocket.Conn) {
 			c := p.tcpMap[connID]
 			p.mu.RUnlock()
 			if connID != "" && c != nil {
-				_, _ = c.Write(msg)
+				// ==== 修复：如果写入本地失败，通知服务端关闭 ====
+				if _, err := c.Write(msg); err != nil {
+					log.Printf("[客户端] 通道 %d 写入本地TCP连接失败: %v，发送CLOSE", channelID, err)
+					go p.SendClose(connID)
+					c.Close()
+					p.mu.Lock()
+					delete(p.tcpMap, connID)
+					p.mu.Unlock()
+				}
 			}
 			continue
 		}
@@ -1785,21 +1811,30 @@ func handleSOCKS5Connect(conn net.Conn, target, clientAddr, wsServerAddr string)
 		return fmt.Errorf("发送SOCKS5成功响应失败: %v", err)
 	}
 
-	// 数据转发由池的通道处理（WS->TCP 在池里），这里只需阻塞直到连接关闭
-	done := make(chan struct{})
-	go func() {
-		buf := make([]byte, 32768)
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				close(done)
-				return
-			}
-			_ = echPool.SendData(connID, buf[:n])
-		}
+	// ==== 修复：确保函数退出时（即本地连接断开时），通知服务端关闭远程连接 ====
+	defer func() {
+		_ = echPool.SendClose(connID)
+		_ = conn.Close()
+		// 从池中清理映射（防止内存泄漏）
+		echPool.mu.Lock()
+		delete(echPool.tcpMap, connID)
+		echPool.mu.Unlock()
+		log.Printf("[SOCKS5:%s] 连接断开，已发送 CLOSE 通知", clientAddr)
 	}()
-	<-done
-	return nil
+
+	buf := make([]byte, 32768)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			// 只要 Read 返回错误（EOF 或 Reset），循环结束，触发 defer 清理
+			return nil
+		}
+		// 写入数据到 WebSocket，如果写入通道失败，也应该退出
+		if err := echPool.SendData(connID, buf[:n]); err != nil {
+			log.Printf("[SOCKS5] 发送数据到通道失败: %v", err)
+			return err
+		}
+	}
 }
 
 // ======================== SOCKS5 UDP ASSOCIATE（使用连接池） ========================
