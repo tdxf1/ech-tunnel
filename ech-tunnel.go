@@ -61,7 +61,7 @@ func init() {
 	flag.StringVar(&keyFile, "key", "", "TLS密钥文件路径（默认:自动生成，仅服务端）")
 	flag.StringVar(&token, "token", "", "身份验证令牌（WebSocket Subprotocol）")
 	flag.StringVar(&cidrs, "cidr", "0.0.0.0/0,::/0", "允许的来源 IP 范围 (CIDR),多个范围用逗号分隔")
-	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "查询 ECH 公钥所用的 DoH 服务器地址)")
+	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "查询 ECH 公钥所用的 DoH 服务器地址")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "用于查询 ECH 公钥的域名")
 	flag.IntVar(&connectionNum, "n", 3, "WebSocket连接数量")
 }
